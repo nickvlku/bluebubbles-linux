@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=BlueBubbles
+Comment=iMessage client for Linux
+Exec=bluebubbles
+Icon=com.github.bluebubbles-linux
+Terminal=false
+Type=Application
+Categories=Network;Chat;InstantMessaging;
+Keywords=imessage;messages;sms;chat;
+StartupNotify=true
