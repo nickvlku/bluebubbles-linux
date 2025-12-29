@@ -2795,6 +2795,21 @@ class MainWindow(Adw.ApplicationWindow):
                     # Save to cache
                     self._cache.save_messages(chat_guid, [message])
 
+                    # Update chat list with new last message
+                    if chat_guid in self._chats_by_guid:
+                        chat = self._chats_by_guid[chat_guid]
+                        chat_data = chat.model_dump(by_alias=True)
+                        chat_data["lastMessage"] = message.model_dump(by_alias=True)
+                        updated_chat = Chat(**chat_data)
+                        self._chats_by_guid[chat_guid] = updated_chat
+
+                        # Move chat to top of list
+                        self._chats = [c for c in self._chats if c.guid != chat_guid]
+                        self._chats.insert(0, updated_chat)
+
+                        # Rebuild the chat list UI
+                        self._rebuild_chat_list_preserving_selection()
+
                     # Check if message already exists (might have arrived via socket)
                     if not any(m.guid == message.guid for m in self._messages):
                         # Add to message list

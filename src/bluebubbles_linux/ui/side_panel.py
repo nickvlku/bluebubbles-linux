@@ -28,6 +28,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from ..api import BlueBubblesClient
 from ..api.models import Chat, Message
+from ..api.websocket import BlueBubblesSocket
 from ..state.cache import Cache
 from ..utils.config import Config
 
@@ -167,10 +168,13 @@ class SidePanelWindow(Adw.ApplicationWindow):
         self._is_animating = False
         self._is_shown = False  # Track logical visibility (not GTK visibility)
         self._slide_animation: Adw.TimedAnimation | None = None
+        self._socket: BlueBubblesSocket | None = None
+        self._socket_thread: threading.Thread | None = None
 
         self._setup_window()
         self._build_ui()
         self._load_data()
+        self._connect_socket()
 
     def _setup_window(self) -> None:
         """Configure window properties and Layer Shell if available."""
@@ -582,6 +586,115 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
         thread = threading.Thread(target=fetch, daemon=True)
         thread.start()
+
+    def _connect_socket(self) -> None:
+        """Connect to BlueBubbles Socket.IO for real-time updates."""
+        if not self._config.is_configured:
+            return
+
+        def run_socket() -> None:
+            async def _connect() -> None:
+                self._socket = BlueBubblesSocket(
+                    self._config.server_url,  # type: ignore
+                    self._config.password,  # type: ignore
+                )
+
+                # Register callbacks
+                self._socket.on_new_message(self._on_socket_new_message)
+                self._socket.on_message_updated(self._on_socket_message_updated)
+                self._socket.on_connected(self._on_socket_connected)
+                self._socket.on_disconnected(self._on_socket_disconnected)
+
+                try:
+                    await self._socket.connect()
+                    await self._socket.wait()
+                except Exception as e:
+                    print(f"Side panel socket connection error: {e}")
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_connect())
+            except Exception as e:
+                print(f"Side panel socket thread error: {e}")
+            finally:
+                loop.close()
+
+        self._socket_thread = threading.Thread(target=run_socket, daemon=True)
+        self._socket_thread.start()
+
+    def _on_socket_connected(self) -> None:
+        """Handle socket connection established."""
+        def update_ui() -> bool:
+            print("Side panel: Socket.IO connected - real-time updates enabled")
+            return False
+        GLib.idle_add(update_ui)
+
+    def _on_socket_disconnected(self) -> None:
+        """Handle socket disconnection."""
+        def update_ui() -> bool:
+            print("Side panel: Socket.IO disconnected")
+            return False
+        GLib.idle_add(update_ui)
+
+    def _on_socket_new_message(self, message: Message, chat_guid: str) -> None:
+        """Handle new message from socket."""
+        def update_ui() -> bool:
+            # Skip reactions for now (keep it simple)
+            if message.is_reaction:
+                return False
+
+            # Find the chat in our list
+            chat_index = -1
+            updated_chat: Chat | None = None
+            for i, chat in enumerate(self._chats):
+                if chat.guid == chat_guid:
+                    chat_index = i
+                    # Update last message
+                    chat_data = chat.model_dump(by_alias=True)
+                    chat_data["lastMessage"] = message.model_dump(by_alias=True)
+                    updated_chat = Chat(**chat_data)
+                    break
+
+            if updated_chat is not None and chat_index >= 0:
+                # Move chat to top of list
+                self._chats.pop(chat_index)
+                self._chats.insert(0, updated_chat)
+                # Rebuild chat list UI
+                self._update_chat_list()
+                self._update_waybar_output()
+
+            # If this chat is currently selected, add the message to the view
+            if self._selected_chat and self._selected_chat.guid == chat_guid:
+                # Check if message already exists
+                if not any(m.guid == message.guid for m in self._messages):
+                    self._messages.append(message)
+                    row = self._create_message_row(message)
+                    self._message_list.append(row)
+                    # Scroll to bottom
+                    def scroll_to_bottom() -> bool:
+                        adj = self._message_list.get_parent().get_vadjustment()  # type: ignore
+                        if adj:
+                            adj.set_value(adj.get_upper())
+                        return False
+                    GLib.timeout_add(50, scroll_to_bottom)
+
+            return False
+
+        GLib.idle_add(update_ui)
+
+    def _on_socket_message_updated(self, message: Message, chat_guid: str) -> None:
+        """Handle message update from socket (e.g., read receipts)."""
+        def update_ui() -> bool:
+            # Update the message in our list if it exists
+            if self._selected_chat and self._selected_chat.guid == chat_guid:
+                for i, msg in enumerate(self._messages):
+                    if msg.guid == message.guid:
+                        self._messages[i] = message
+                        break
+            return False
+
+        GLib.idle_add(update_ui)
 
     def _update_chat_list(self) -> None:
         """Update the chat list."""
