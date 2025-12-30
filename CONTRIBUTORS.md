@@ -4,14 +4,7 @@ Thank you to everyone who has contributed to BlueBubbles Linux!
 
 ## Maintainers
 
-- **Nick** - Creator and lead maintainer
-
-## Contributors
-
-<!--
-Add your name here when you contribute!
-Format: - **Name** (@github-username) - Description of contribution
--->
+- **Nick Vlku**  (@nickvlku)
 
 ## How to Contribute
 
@@ -26,7 +19,7 @@ We welcome contributions! Here's how you can help:
 ### Development Setup
 
 ```bash
-git clone https://github.com/yourusername/bluebubbles-linux.git
+git clone https://github.com/nickvlku/bluebubbles-linux.git
 cd bluebubbles-linux
 python -m venv .venv
 source .venv/bin/activate
