@@ -36,8 +36,6 @@ from ..utils.config import Config
 # IPC socket path
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bluebubbles-panel.sock"
 
-# Waybar output path
-WAYBAR_OUTPUT_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bluebubbles-waybar.json"
 
 # Panel position setting file
 PANEL_CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bluebubbles" / "panel.json"
@@ -163,7 +161,6 @@ class SidePanelWindow(Adw.ApplicationWindow):
         self._chats: list[Chat] = []
         self._selected_chat: Chat | None = None
         self._contacts: dict[str, str] = {}
-        self._unread_count = 0
         self._messages: list[Message] = []
         self._is_animating = False
         self._is_shown = False  # Track logical visibility (not GTK visibility)
@@ -186,9 +183,17 @@ class SidePanelWindow(Adw.ApplicationWindow):
         else:
             self.set_default_size(600, 400)
 
+        # Track if layer shell is actually working (not just imported)
+        self._layer_shell_active = False
+
         if HAS_LAYER_SHELL:
             # Initialize Layer Shell
             Gtk4LayerShell.init_for_window(self)
+            # Check if it actually worked
+            self._layer_shell_active = Gtk4LayerShell.is_layer_window(self)
+            if not self._layer_shell_active:
+                print("gtk4-layer-shell initialization failed - running as regular window")
+                return
             Gtk4LayerShell.set_layer(self, Gtk4LayerShell.Layer.TOP)
 
             # Configure anchoring based on position
@@ -224,9 +229,10 @@ class SidePanelWindow(Adw.ApplicationWindow):
             # Set namespace for window rules
             Gtk4LayerShell.set_namespace(self, "bluebubbles-panel")
 
-            # Allow keyboard input
+            # Start with no keyboard grab (panel starts hidden)
+            # Keyboard will be enabled when panel slides in
             Gtk4LayerShell.set_keyboard_mode(
-                self, Gtk4LayerShell.KeyboardMode.ON_DEMAND
+                self, Gtk4LayerShell.KeyboardMode.NONE
             )
 
         # Handle keyboard events
@@ -236,7 +242,7 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
     def _get_slide_edge(self) -> "Gtk4LayerShell.Edge | None":
         """Get the edge to animate for sliding."""
-        if not HAS_LAYER_SHELL:
+        if not self._layer_shell_active:
             return None
         edge_map = {
             "left": Gtk4LayerShell.Edge.LEFT,
@@ -259,7 +265,7 @@ class SidePanelWindow(Adw.ApplicationWindow):
         if self._is_shown or self._is_animating:
             return
 
-        if not HAS_LAYER_SHELL:
+        if not self._layer_shell_active:
             self._is_shown = True
             Adw.ApplicationWindow.present(self)
             return
@@ -283,6 +289,11 @@ class SidePanelWindow(Adw.ApplicationWindow):
         def on_done(_anim: Adw.TimedAnimation) -> None:
             self._is_animating = False
             self._is_shown = True
+            # Enable keyboard input when fully shown
+            if self._layer_shell_active:
+                Gtk4LayerShell.set_keyboard_mode(
+                    self, Gtk4LayerShell.KeyboardMode.ON_DEMAND
+                )
 
         self._slide_animation.connect("done", on_done)
         self._slide_animation.play()
@@ -292,10 +303,15 @@ class SidePanelWindow(Adw.ApplicationWindow):
         if not self._is_shown or self._is_animating:
             return
 
-        if not HAS_LAYER_SHELL:
+        if not self._layer_shell_active:
             self._is_shown = False
             Adw.ApplicationWindow.hide(self)
             return
+
+        # Disable keyboard grab immediately when starting to slide out
+        Gtk4LayerShell.set_keyboard_mode(
+            self, Gtk4LayerShell.KeyboardMode.NONE
+        )
 
         self._is_animating = True
         self._is_shown = False
@@ -498,34 +514,6 @@ class SidePanelWindow(Adw.ApplicationWindow):
             .panel-window {
                 background-color: alpha(@window_bg_color, 0.95);
             }
-            .unread-badge {
-                background-color: @accent_bg_color;
-                color: @accent_fg_color;
-                border-radius: 10px;
-                padding: 2px 8px;
-                font-size: 0.8em;
-                font-weight: bold;
-            }
-            .message-row {
-                padding: 8px 12px;
-            }
-            .message-from-me {
-                background-color: alpha(@accent_bg_color, 0.3);
-                border-radius: 12px;
-                margin-left: 40px;
-            }
-            .message-from-other {
-                background-color: alpha(@view_bg_color, 0.5);
-                border-radius: 12px;
-                margin-right: 40px;
-            }
-            .message-text {
-                padding: 8px 12px;
-            }
-            .message-time {
-                font-size: 0.8em;
-                padding: 4px 12px;
-            }
         """)
         Gtk.StyleContext.add_provider_for_display(
             self.get_display(),
@@ -534,53 +522,72 @@ class SidePanelWindow(Adw.ApplicationWindow):
         )
 
     def _load_data(self) -> None:
-        """Load chats and contacts."""
+        """Load chats from cache first, then sync from server."""
         if not self._config.is_configured:
             return
 
+        # Step 1: Load from cache immediately (on main thread for fast startup)
+        cached_chats = self._cache.get_all_chats()
+        cached_contacts = self._cache.get_all_contacts()  # Returns dict[str, str]
+
+        if cached_chats:
+            self._chats = cached_chats
+            self._contacts = cached_contacts  # Already a dict
+            self._update_chat_list()
+
+        # Step 2: Also fetch from server to get any very recent chats not yet in cache
+        # (but don't replace cache data - merge it)
         def fetch() -> None:
-            async def _fetch() -> tuple[list[Chat], dict[str, str]]:
+            async def _fetch() -> list[Chat]:
                 client = BlueBubblesClient(
                     self._config.server_url,  # type: ignore
                     self._config.password,  # type: ignore
                 )
                 try:
                     await client.connect()
-                    chats = await client.get_chats(limit=20)
-                    contacts = await client.get_contacts()
-
-                    # Build contacts dict
-                    contacts_dict: dict[str, str] = {}
-                    for contact in contacts:
-                        if contact.display_name:
-                            for phone in contact.phones:
-                                addr = phone.get("address", "")
-                                if addr:
-                                    contacts_dict[addr] = contact.display_name
-                            for email in contact.emails:
-                                addr = email.get("address", "")
-                                if addr:
-                                    contacts_dict[addr.lower()] = contact.display_name
-
-                    return chats, contacts_dict
+                    chats = await client.get_chats(limit=50)
+                    return chats
                 finally:
                     await client.close()
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                chats, contacts = loop.run_until_complete(_fetch())
+                server_chats = loop.run_until_complete(_fetch())
 
-                def update_ui() -> bool:
-                    self._chats = chats
-                    self._contacts = contacts
+                def merge_and_update() -> bool:
+                    # Merge server chats with cached chats
+                    # Server chats may have more recent messages
+                    chats_by_guid = {c.guid: c for c in self._chats}
+                    chats_by_identifier = {c.chat_identifier: c for c in self._chats}
+
+                    for chat in server_chats:
+                        existing = chats_by_guid.get(chat.guid) or chats_by_identifier.get(chat.chat_identifier)
+                        if existing:
+                            # Update if server has newer last message
+                            if chat.last_message and existing.last_message:
+                                if chat.last_message.date_created > existing.last_message.date_created:
+                                    chats_by_guid[existing.guid] = chat
+                            elif chat.last_message and not existing.last_message:
+                                chats_by_guid[existing.guid] = chat
+                        else:
+                            # New chat not in cache
+                            chats_by_guid[chat.guid] = chat
+
+                    # Sort by last message date
+                    all_chats = list(chats_by_guid.values())
+                    all_chats.sort(
+                        key=lambda c: c.last_message.date_created if c.last_message else 0,
+                        reverse=True
+                    )
+
+                    self._chats = all_chats
                     self._update_chat_list()
-                    self._update_waybar_output()
                     return False
 
-                GLib.idle_add(update_ui)
-            except Exception as e:
-                print(f"Error loading data: {e}")
+                GLib.idle_add(merge_and_update)
+            except Exception:
+                pass  # Server fetch failed, but we have cache data
             finally:
                 loop.close()
 
@@ -608,15 +615,15 @@ class SidePanelWindow(Adw.ApplicationWindow):
                 try:
                     await self._socket.connect()
                     await self._socket.wait()
-                except Exception as e:
-                    print(f"Side panel socket connection error: {e}")
+                except Exception:
+                    pass  # Connection failed or disconnected
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(_connect())
-            except Exception as e:
-                print(f"Side panel socket thread error: {e}")
+            except Exception:
+                pass
             finally:
                 loop.close()
 
@@ -625,17 +632,11 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
     def _on_socket_connected(self) -> None:
         """Handle socket connection established."""
-        def update_ui() -> bool:
-            print("Side panel: Socket.IO connected - real-time updates enabled")
-            return False
-        GLib.idle_add(update_ui)
+        pass  # Could show a status indicator if desired
 
     def _on_socket_disconnected(self) -> None:
         """Handle socket disconnection."""
-        def update_ui() -> bool:
-            print("Side panel: Socket.IO disconnected")
-            return False
-        GLib.idle_add(update_ui)
+        pass  # Could show a status indicator if desired
 
     def _on_socket_new_message(self, message: Message, chat_guid: str) -> None:
         """Handle new message from socket."""
@@ -644,11 +645,11 @@ class SidePanelWindow(Adw.ApplicationWindow):
             if message.is_reaction:
                 return False
 
-            # Find the chat in our list
+            # Find the chat in our list (check both guid and chat_identifier)
             chat_index = -1
             updated_chat: Chat | None = None
             for i, chat in enumerate(self._chats):
-                if chat.guid == chat_guid:
+                if chat.guid == chat_guid or chat.chat_identifier == chat_guid:
                     chat_index = i
                     # Update last message
                     chat_data = chat.model_dump(by_alias=True)
@@ -662,10 +663,12 @@ class SidePanelWindow(Adw.ApplicationWindow):
                 self._chats.insert(0, updated_chat)
                 # Rebuild chat list UI
                 self._update_chat_list()
-                self._update_waybar_output()
+            else:
+                # Fetch the chat from the API and add it
+                self._fetch_and_add_chat(chat_guid, message)
 
             # If this chat is currently selected, add the message to the view
-            if self._selected_chat and self._selected_chat.guid == chat_guid:
+            if self._selected_chat and (self._selected_chat.guid == chat_guid or self._selected_chat.chat_identifier == chat_guid):
                 # Check if message already exists
                 if not any(m.guid == message.guid for m in self._messages):
                     self._messages.append(message)
@@ -683,11 +686,49 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
         GLib.idle_add(update_ui)
 
+    def _fetch_and_add_chat(self, chat_guid: str, message: Message) -> None:
+        """Fetch a chat from the API and add it to the top of the list."""
+        def fetch() -> None:
+            async def _fetch() -> Chat | None:
+                client = BlueBubblesClient(
+                    self._config.server_url,  # type: ignore
+                    self._config.password,  # type: ignore
+                )
+                try:
+                    await client.connect()
+                    chat = await client.get_chat(chat_guid)
+                    return chat
+                except Exception:
+                    return None
+                finally:
+                    await client.close()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                chat = loop.run_until_complete(_fetch())
+                if chat:
+                    def add_to_ui() -> bool:
+                        # Update last message
+                        chat_data = chat.model_dump(by_alias=True)
+                        chat_data["lastMessage"] = message.model_dump(by_alias=True)
+                        updated_chat = Chat(**chat_data)
+                        # Add to top of list
+                        self._chats.insert(0, updated_chat)
+                        self._update_chat_list()
+                        return False
+                    GLib.idle_add(add_to_ui)
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=fetch, daemon=True)
+        thread.start()
+
     def _on_socket_message_updated(self, message: Message, chat_guid: str) -> None:
         """Handle message update from socket (e.g., read receipts)."""
         def update_ui() -> bool:
             # Update the message in our list if it exists
-            if self._selected_chat and self._selected_chat.guid == chat_guid:
+            if self._selected_chat and (self._selected_chat.guid == chat_guid or self._selected_chat.chat_identifier == chat_guid):
                 for i, msg in enumerate(self._messages):
                     if msg.guid == message.guid:
                         self._messages[i] = message
@@ -705,28 +746,15 @@ class SidePanelWindow(Adw.ApplicationWindow):
                 break
             self._chat_list.remove(row)
 
-        # Count unread based on last message read status
-        self._unread_count = 0
-
-        for chat in self._chats:
+        # Only display top 50 chats for performance
+        for chat in self._chats[:50]:
             row = self._create_chat_row(chat)
             self._chat_list.append(row)
-
-            # Check if last message is unread (from someone else and not read)
-            if chat.last_message and not chat.last_message.is_from_me and not chat.last_message.is_read:
-                self._unread_count += 1
 
     def _create_chat_row(self, chat: Chat) -> Gtk.ListBoxRow:
         """Create a compact chat row."""
         row = Gtk.ListBoxRow()
         row.chat = chat  # type: ignore
-
-        # Check if has unread message
-        has_unread = (
-            chat.last_message
-            and not chat.last_message.is_from_me
-            and not chat.last_message.is_read
-        )
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         box.set_margin_start(10)
@@ -747,8 +775,6 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
         name_label = Gtk.Label(label=title, xalign=0)
         name_label.set_ellipsize(3)
-        if has_unread:
-            name_label.add_css_class("heading")
         text_box.append(name_label)
 
         # Preview
@@ -767,30 +793,64 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
         box.append(text_box)
 
-        # Unread badge
-        if has_unread:
-            badge = Gtk.Label(label="●")
-            badge.add_css_class("unread-badge")
-            box.append(badge)
-
         row.set_child(box)
         return row
 
+    def _normalize_phone(self, phone: str) -> list[str]:
+        """
+        Normalize a phone number for comparison (remove formatting).
+        Returns multiple variants to handle country code differences.
+        """
+        import re
+        # Remove all non-digit characters
+        digits_only = re.sub(r"[^\d]", "", phone)
+
+        variants = []
+
+        # Add the digits-only version
+        if digits_only:
+            variants.append(digits_only)
+
+            # If it starts with country code 1 (US/Canada), also try without it
+            if digits_only.startswith("1") and len(digits_only) == 11:
+                variants.append(digits_only[1:])  # Without country code
+
+            # If it's 10 digits, also try with +1 prefix
+            if len(digits_only) == 10:
+                variants.append("1" + digits_only)  # With country code
+                variants.append("+1" + digits_only)  # With + prefix
+
+            # Also add +digits version
+            variants.append("+" + digits_only)
+
+        return variants
+
+    def _get_display_name(self, address: str) -> str:
+        """Get display name for an address, using contacts if available."""
+        # Try exact match first
+        if address in self._contacts:
+            return self._contacts[address]
+        # Try all normalized phone variants
+        for variant in self._normalize_phone(address):
+            if variant in self._contacts:
+                return self._contacts[variant]
+        # Try lowercase for emails
+        if "@" in address and address.lower() in self._contacts:
+            return self._contacts[address.lower()]
+        return address
+
     def _get_chat_title(self, chat: Chat) -> str:
-        """Get display title for a chat."""
+        """Get display title for a chat, using contacts if available."""
         if chat.display_name:
             return chat.display_name
-
         if chat.participants:
             names = []
             for p in chat.participants[:3]:
-                name = self._contacts.get(p.address, p.address)
+                name = self._get_display_name(p.address)
                 names.append(name)
-            title = ", ".join(names)
             if len(chat.participants) > 3:
-                title += f" +{len(chat.participants) - 3}"
-            return title
-
+                return ", ".join(names) + f" +{len(chat.participants) - 3}"
+            return ", ".join(names)
         return chat.chat_identifier
 
     def _on_chat_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
@@ -818,8 +878,8 @@ class SidePanelWindow(Adw.ApplicationWindow):
         # Load messages
         self._load_messages(chat.guid)
 
-        # Focus entry after a short delay
-        GLib.timeout_add(100, lambda: self._message_entry.grab_focus() or False)
+        # NOTE: Don't call grab_focus() - it causes text entry issues
+        # The user can click on the entry to focus it
 
     def _load_messages(self, chat_guid: str) -> None:
         """Load messages for a chat."""
@@ -847,8 +907,8 @@ class SidePanelWindow(Adw.ApplicationWindow):
                     return False
 
                 GLib.idle_add(update_ui)
-            except Exception as e:
-                print(f"Error loading messages: {e}")
+            except Exception:
+                pass
             finally:
                 loop.close()
 
@@ -879,44 +939,165 @@ class SidePanelWindow(Adw.ApplicationWindow):
             return False
         GLib.timeout_add(100, scroll_to_bottom)
 
+    # Sender colors for message bubbles (same as main app)
+    SENDER_COLORS = [
+        "#ffc7c7",  # Light pink/coral
+        "#ffe7c7",  # Light peach
+        "#f9ffc7",  # Light yellow
+        "#c7ffcb",  # Light green
+        "#c7f4ff",  # Light blue
+        "#e7c7ff",  # Light purple
+        "#ffc7e7",  # Light rose
+        "#c7ffe7",  # Light mint
+    ]
+
+    def _get_sender_color(self, address: str) -> str:
+        """Get a consistent color for a sender based on their address."""
+        color_index = hash(address) % len(self.SENDER_COLORS)
+        return self.SENDER_COLORS[color_index]
+
+    def _get_sender_name(self, msg: Message) -> str:
+        """Get display name for message sender."""
+        if msg.handle:
+            return self._get_display_name(msg.handle.address)
+        return "Unknown"
+
     def _create_message_row(self, msg: Message) -> Gtk.ListBoxRow:
-        """Create a message row."""
+        """Create a message bubble row (matching main app style)."""
         row = Gtk.ListBoxRow()
         row.set_activatable(False)
         row.set_selectable(False)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        box.add_css_class("message-row")
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        container.set_margin_top(2)
+        container.set_margin_bottom(2)
+
+        outer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+
+        is_group = self._selected_chat and self._selected_chat.is_group
+
+        bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
 
         if msg.is_from_me:
-            box.add_css_class("message-from-me")
-            box.set_halign(Gtk.Align.END)
+            # Sent message - blue/right aligned
+            bubble.set_margin_start(60)
+            bubble.set_margin_end(12)
+            bubble.set_halign(Gtk.Align.END)
+            outer_box.set_halign(Gtk.Align.END)
+
+            # Apply iMessage blue style
+            css_provider = Gtk.CssProvider()
+            css_provider.load_from_data(b"""
+                .message-bubble-sent {
+                    background-color: #007AFF;
+                    color: white;
+                    border-radius: 18px;
+                    padding: 10px 14px;
+                }
+                .message-bubble-sent label {
+                    color: white;
+                }
+                .status-label-sent {
+                    color: rgba(255, 255, 255, 0.7);
+                }
+            """)
+            Gtk.StyleContext.add_provider_for_display(
+                self.get_display(),
+                css_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+            bubble.add_css_class("message-bubble-sent")
         else:
-            box.add_css_class("message-from-other")
-            box.set_halign(Gtk.Align.START)
+            # Received message - colored based on sender
+            bubble.set_margin_start(12)
+            bubble.set_margin_end(60)
+            bubble.set_halign(Gtk.Align.START)
+            outer_box.set_halign(Gtk.Align.START)
+
+            sender_address = self._get_sender_name(msg)
+            sender_color = self._get_sender_color(sender_address)
+
+            # Show sender name in group chats
+            if is_group:
+                sender_label = Gtk.Label(label=sender_address, xalign=0)
+                sender_label.add_css_class("caption")
+                sender_label.set_margin_bottom(2)
+                name_css = Gtk.CssProvider()
+                name_css.load_from_data(f"""
+                    .sender-name-panel {{
+                        color: darker({sender_color});
+                        font-weight: 600;
+                    }}
+                """.encode())
+                Gtk.StyleContext.add_provider_for_display(
+                    self.get_display(),
+                    name_css,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+                sender_label.add_css_class("sender-name-panel")
+                bubble.append(sender_label)
+
+            # Apply colored bubble style
+            bubble_css = Gtk.CssProvider()
+            bubble_css.load_from_data(f"""
+                .message-bubble-received {{
+                    background-color: {sender_color};
+                    color: #333333;
+                    border-radius: 18px;
+                    padding: 10px 14px;
+                }}
+            """.encode())
+            Gtk.StyleContext.add_provider_for_display(
+                self.get_display(),
+                bubble_css,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+            bubble.add_css_class("message-bubble-received")
 
         # Message text
         if msg.text:
-            text_label = Gtk.Label(label=msg.text, xalign=0 if not msg.is_from_me else 1)
+            text_label = Gtk.Label(label=msg.text, xalign=0)
             text_label.set_wrap(True)
             text_label.set_wrap_mode(2)  # WORD_CHAR
-            text_label.add_css_class("message-text")
-            text_label.set_max_width_chars(35)
-            box.append(text_label)
+            text_label.set_max_width_chars(30)
+            text_label.set_selectable(True)
+            bubble.append(text_label)
         elif msg.has_attachments:
-            text_label = Gtk.Label(label="(attachment)", xalign=0 if not msg.is_from_me else 1)
-            text_label.add_css_class("message-text")
+            text_label = Gtk.Label(label="(attachment)", xalign=0)
             text_label.add_css_class("dim-label")
-            box.append(text_label)
+            bubble.append(text_label)
 
-        # Time
-        time_str = msg.date_created_dt.strftime("%H:%M")
-        time_label = Gtk.Label(label=time_str, xalign=1 if msg.is_from_me else 0)
-        time_label.add_css_class("message-time")
-        time_label.add_css_class("dim-label")
-        box.append(time_label)
+        # Time row
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        time_str = msg.date_created_dt.strftime("%I:%M %p")
+        time_label = Gtk.Label(label=time_str)
+        time_label.add_css_class("caption")
 
-        row.set_child(box)
+        if msg.is_from_me:
+            time_label.add_css_class("status-label-sent")
+            status_box.set_halign(Gtk.Align.END)
+        else:
+            status_box.set_halign(Gtk.Align.START)
+            if not is_group:
+                sender_name = self._get_sender_name(msg)
+                sender_status = Gtk.Label(label=sender_name)
+                sender_status.add_css_class("caption")
+                sender_status.add_css_class("dim-label")
+                status_box.append(sender_status)
+                sep = Gtk.Label(label="·")
+                sep.add_css_class("caption")
+                sep.add_css_class("dim-label")
+                status_box.append(sep)
+            time_label.add_css_class("dim-label")
+
+        status_box.append(time_label)
+        bubble.append(status_box)
+
+        outer_box.append(bubble)
+        outer_box.set_hexpand(True)
+        container.append(outer_box)
+
+        row.set_child(container)
         return row
 
     def _go_back_to_list(self) -> None:
@@ -947,8 +1128,7 @@ class SidePanelWindow(Adw.ApplicationWindow):
                 try:
                     await client.connect()
                     return await client.send_message(chat_guid, text)
-                except Exception as e:
-                    print(f"Error sending: {e}")
+                except Exception:
                     return None
                 finally:
                     await client.close()
@@ -973,21 +1153,6 @@ class SidePanelWindow(Adw.ApplicationWindow):
 
         thread = threading.Thread(target=send, daemon=True)
         thread.start()
-
-    def _update_waybar_output(self) -> None:
-        """Update the waybar JSON output file."""
-        try:
-            output = {
-                "text": str(self._unread_count) if self._unread_count > 0 else "",
-                "tooltip": f"{self._unread_count} unread messages" if self._unread_count else "No unread messages",
-                "class": "has-unread" if self._unread_count > 0 else "no-unread",
-                "alt": "unread" if self._unread_count > 0 else "read",
-            }
-
-            WAYBAR_OUTPUT_PATH.write_text(json.dumps(output))
-        except Exception as e:
-            print(f"Error updating waybar output: {e}")
-
 
 def send_ipc_command(command: str) -> str | None:
     """Send a command to a running panel instance."""

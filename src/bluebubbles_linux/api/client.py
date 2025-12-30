@@ -187,7 +187,7 @@ class BlueBubblesClient:
         if with_participants:
             includes.append("participants")
         if with_last_message:
-            includes.append("lastMessage")
+            includes.append("lastmessage")  # Must be lowercase for server to recognize
 
         # BlueBubbles uses POST /chat/query for listing chats
         data: dict[str, Any] = {
