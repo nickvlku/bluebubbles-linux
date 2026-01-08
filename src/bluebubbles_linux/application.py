@@ -40,6 +40,10 @@ class BlueBubblesApplication(Adw.Application):
                 self._main_window = self._create_main_window()
             else:
                 self._main_window = self._create_setup_window()
+        else:
+            # Window already exists - refresh chat list from cache
+            if hasattr(self._main_window, 'refresh_chat_list'):
+                self._main_window.refresh_chat_list()
 
         self._main_window.present()
 

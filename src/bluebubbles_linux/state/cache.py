@@ -27,10 +27,26 @@ class Cache:
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create database connection."""
+        """Get or create database connection.
+
+        Uses WAL mode for better concurrency - allows reads while writes are happening.
+        This prevents the database from blocking the UI thread when background
+        threads are writing.
+        """
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30.0,  # Wait up to 30s for locks instead of failing immediately
+            )
             self._conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrent read/write performance
+            # WAL allows readers to continue while a write is in progress
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # Synchronous NORMAL is safe with WAL and faster than FULL
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            # Enable foreign keys
+            self._conn.execute("PRAGMA foreign_keys=ON")
         return self._conn
 
     def _init_db(self) -> None:

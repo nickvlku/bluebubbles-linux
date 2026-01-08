@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from ..api import BlueBubblesClient, Chat, Message, Attachment, BlueBubblesSocket
 from ..api.models import TapbackType
 from ..state import Cache
+from ..utils.debounce import Debouncer
 from ..utils.links import find_urls, fetch_link_preview, LinkPreview
 
 
@@ -39,6 +40,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._contacts: dict[str, str] = {}  # address -> display name
         self._message_scroll: Gtk.ScrolledWindow | None = None  # For scroll control
         self._pending_conversation: dict | None = None  # For new conversations
+        self._rows_by_guid: dict[str, Gtk.ListBoxRow] = {}  # chat_guid -> row widget
+
+        # Debouncer for batching rapid chat list updates (e.g., multiple incoming messages)
+        self._chat_update_debouncer: Debouncer[str] = Debouncer(
+            callback=self._process_batched_chat_updates,
+            delay_ms=100,
+            scheduler=lambda cb: GLib.timeout_add(100, cb),
+            cancel_scheduler=GLib.source_remove,
+        )
 
         self._setup_window()
         self._build_ui()
@@ -322,7 +332,128 @@ class MainWindow(Adw.ApplicationWindow):
         box.append(text_box)
 
         row.set_child(box)
+
+        # Track this row for efficient updates
+        self._rows_by_guid[chat.guid] = row
+
         return row
+
+    def _update_chat_row_content(self, row: Gtk.ListBoxRow, chat: Chat) -> None:
+        """Update an existing row's content without recreating it."""
+        # Update the stored chat reference
+        row.chat = chat  # type: ignore
+
+        box = row.get_child()
+        if not isinstance(box, Gtk.Box):
+            return
+
+        # Get children: avatar, text_box
+        avatar = box.get_first_child()
+        text_box = avatar.get_next_sibling() if avatar else None
+
+        if not text_box or not isinstance(text_box, Gtk.Box):
+            return
+
+        # Get title
+        title = self._get_chat_title(chat)
+
+        # Update avatar
+        if isinstance(avatar, Adw.Avatar):
+            avatar.set_text(title)
+
+        # Update name label (first child of text_box)
+        name_label = text_box.get_first_child()
+        if isinstance(name_label, Gtk.Label):
+            name_label.set_label(title)
+
+        # Update preview label (second child of text_box)
+        preview_label = name_label.get_next_sibling() if name_label else None
+        if isinstance(preview_label, Gtk.Label):
+            if chat.last_message:
+                last_msg = chat.last_message
+                if last_msg.is_reaction:
+                    tapback = last_msg.tapback_type
+                    if tapback:
+                        reaction_emoji = {
+                            TapbackType.LOVE: "❤️",
+                            TapbackType.LIKE: "👍",
+                            TapbackType.DISLIKE: "👎",
+                            TapbackType.LAUGH: "😂",
+                            TapbackType.EMPHASIZE: "‼️",
+                            TapbackType.QUESTION: "❓",
+                        }.get(tapback, "")
+                        preview_text = f"Reacted {reaction_emoji}"
+                    else:
+                        preview_text = "Reacted"
+                    if last_msg.is_from_me:
+                        preview_text = f"You: {preview_text}"
+                else:
+                    preview_text = last_msg.text or "(attachment)"
+                    if last_msg.is_from_me:
+                        preview_text = f"You: {preview_text}"
+            else:
+                preview_text = "No messages"
+            preview_label.set_label(preview_text)
+
+    def _move_chat_row_to_top(self, chat_guid: str) -> None:
+        """Move a chat row to the top of the list."""
+        row = self._rows_by_guid.get(chat_guid)
+        if not row:
+            return
+
+        # Check if already at top
+        first_row = self._chat_list.get_row_at_index(0)
+        if first_row == row:
+            return
+
+        # Remember if this row was selected
+        was_selected = self._chat_list.get_selected_row() == row
+
+        # Remove from current position
+        self._chat_list.remove(row)
+
+        # Insert at top
+        self._chat_list.prepend(row)
+
+        # Restore selection if needed
+        if was_selected:
+            self._chat_list.select_row(row)
+
+    def _process_batched_chat_updates(self, chat_guids: list[str]) -> None:
+        """Process a batch of chat updates efficiently.
+
+        This is called by the debouncer after a settling period.
+        Instead of rebuilding the entire list for each message,
+        we update only the affected rows.
+        """
+        if not chat_guids:
+            return
+
+        # Deduplicate while preserving order (most recent first)
+        seen: set[str] = set()
+        unique_guids: list[str] = []
+        for guid in reversed(chat_guids):
+            if guid not in seen:
+                seen.add(guid)
+                unique_guids.append(guid)
+        unique_guids.reverse()
+
+        # Process each unique chat
+        for chat_guid in unique_guids:
+            chat = self._chats_by_guid.get(chat_guid)
+            if not chat:
+                continue
+
+            row = self._rows_by_guid.get(chat_guid)
+            if row:
+                # Update existing row content
+                self._update_chat_row_content(row, chat)
+                # Move to top
+                self._move_chat_row_to_top(chat_guid)
+            else:
+                # New chat - create and prepend
+                row = self._create_chat_row(chat)
+                self._chat_list.prepend(row)
 
     # Pastel color palette for sender bubbles
     # From https://www.color-hex.com/color-palette/1023412
@@ -1549,11 +1680,13 @@ class MainWindow(Adw.ApplicationWindow):
                         # Save to cache
                         self._cache.save_chats(batch)
 
-                        # Add new chats to UI
+                        # Track truly new chats for the status message
                         new_chats = [c for c in batch if c.guid not in self._chats_by_guid]
-                        if new_chats:
-                            new_chats_batch.extend(new_chats)
-                            GLib.idle_add(add_chats_to_ui, new_chats, False)
+                        new_chats_batch.extend(new_chats)
+
+                        # Update UI with ALL chats from batch (both new and existing)
+                        # This ensures existing chats get their data refreshed from server
+                        GLib.idle_add(add_chats_to_ui, batch, False)
 
                         if len(batch) < batch_size:
                             break
@@ -1564,6 +1697,17 @@ class MainWindow(Adw.ApplicationWindow):
 
                 final_count = len(self._chats_by_guid)
                 new_count = len(new_chats_batch)
+
+                # Sort chats by last message date and rebuild UI
+                def sort_and_rebuild() -> bool:
+                    self._chats.sort(
+                        key=lambda c: c.last_message.date_created if c.last_message else 0,
+                        reverse=True
+                    )
+                    self._rebuild_chat_list_preserving_selection()
+                    return False
+                GLib.idle_add(sort_and_rebuild)
+
                 if new_count > 0:
                     GLib.idle_add(
                         show_status,
@@ -1590,6 +1734,36 @@ class MainWindow(Adw.ApplicationWindow):
 
         thread = threading.Thread(target=load_and_sync, daemon=True)
         thread.start()
+
+    def refresh_chat_list(self) -> None:
+        """Refresh chat list from cache - called when app is reactivated."""
+        cached_chats = self._cache.get_all_chats()
+        if not cached_chats:
+            return
+
+        # Update chats with any new/updated ones from cache
+        for chat in cached_chats:
+            if chat.guid in self._chats_by_guid:
+                # Update existing chat if newer
+                existing = self._chats_by_guid[chat.guid]
+                if chat.last_message and existing.last_message:
+                    if chat.last_message.date_created > existing.last_message.date_created:
+                        self._chats_by_guid[chat.guid] = chat
+                        for i, c in enumerate(self._chats):
+                            if c.guid == chat.guid:
+                                self._chats[i] = chat
+                                break
+            else:
+                # New chat - add it
+                self._chats.append(chat)
+                self._chats_by_guid[chat.guid] = chat
+
+        # Re-sort by last message date and rebuild UI
+        self._chats.sort(
+            key=lambda c: c.last_message.date_created if c.last_message else 0,
+            reverse=True
+        )
+        self._rebuild_chat_list_preserving_selection()
 
     def _connect_socket(self) -> None:
         """Connect to BlueBubbles Socket.IO for real-time updates."""
@@ -1670,8 +1844,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self._chats = [c for c in self._chats if c.guid != chat_guid]
                 self._chats.insert(0, updated_chat)
 
-                # Rebuild the chat list UI to reflect new order
-                self._rebuild_chat_list_preserving_selection()
+                # Queue the UI update (debounced to batch rapid messages)
+                self._chat_update_debouncer.add(chat_guid)
 
             # If this chat is currently selected, add the message to the view
             if self._selected_chat and self._selected_chat.guid == chat_guid:
@@ -1938,6 +2112,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _update_chat_list(self) -> None:
         """Update the chat list UI."""
+        # Clear row tracking
+        self._rows_by_guid.clear()
+
         # Clear existing rows
         while True:
             row = self._chat_list.get_row_at_index(0)
@@ -1954,6 +2131,9 @@ class MainWindow(Adw.ApplicationWindow):
         """Rebuild the chat list UI while preserving the current selection."""
         # Remember the currently selected chat
         selected_guid = self._selected_chat.guid if self._selected_chat else None
+
+        # Clear row tracking
+        self._rows_by_guid.clear()
 
         # Clear existing rows
         while True:
